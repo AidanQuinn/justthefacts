@@ -108,7 +108,6 @@ class Config:
 SOURCES = [
     # Center
     {"name": "AP News", "url": "https://apnews.com/hub/ap-top-news?output=1", "lean": "center"},
-    {"name": "Reuters", "url": "https://feeds.reuters.com/reuters/topNews", "lean": "center"},
     {"name": "BBC", "url": "https://feeds.bbci.co.uk/news/rss.xml", "lean": "center"},
 
     # Left
@@ -244,6 +243,7 @@ class NewsAggregator:
     # -------- Fetch --------
     def fetch_feeds(self) -> List[Dict]:
         articles = []
+        per_source_counts = []
         for src in SOURCES:
             url = src["url"]
             name = src["name"]
@@ -253,6 +253,7 @@ class NewsAggregator:
                 feed = feedparser.parse(resp.content)
                 n = len(feed.entries or [])
                 logger.info(f"Fetched {n:>3} entries from {name}")
+                per_source_counts.append((name, n))
                 for e in feed.entries[:40]:
                     link = e.get("link") or ""
                     title = (e.get("title") or "").strip()
@@ -271,7 +272,8 @@ class NewsAggregator:
                     )
             except Exception as ex:
                 logger.warning(f"{name}: fetch failed ({ex})")
-        logger.info(f"TOTAL raw articles: {len(articles)}")
+        sources_with_entries = len([c for c in per_source_counts if c[1] > 0])
+        logger.info(f"TOTAL raw articles: {len(articles)} (sources with entries: {sources_with_entries}/{len(SOURCES)})")
         return articles
 
     # -------- Extract --------
@@ -388,6 +390,7 @@ class NewsAggregator:
         )
         X = vectorizer.fit_transform(texts).toarray()
         norms = np.linalg.norm(X, axis=1, keepdims=True)
+        logger.info("Using TF-IDF embeddings (fallback)")
         return X / (norms + 1e-10)
 
     def cluster_articles(self, articles: List[Dict], embeddings: np.ndarray) -> List[List[Dict]]:
@@ -465,6 +468,7 @@ class NewsAggregator:
             f"**Coverage Balance:** Left {lean_counts.get('left',0)} | Center {lean_counts.get('center',0)} | Right {lean_counts.get('right',0)}\n\n"
             f"**Key Points:**\n{key_text[:700]}..."
         )
+        summary += self._source_links_block(representatives)
 
         return {
             "title": title,
@@ -472,6 +476,19 @@ class NewsAggregator:
             "sources": [{"name": r["source"], "lean": r["lean"], "url": r["url"]} for r in representatives],
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+
+    def _source_links_block(self, representatives: List[Dict]) -> str:
+        lines = []
+        for r in representatives:
+            url = r.get("url", "")
+            lines.append(f"- {url}")
+        return "\n\nSources:\n" + "\n".join(lines)
+
+    def _with_sources_block(self, summary_text: str, representatives: List[Dict]) -> str:
+        block = self._source_links_block(representatives)
+        if "Sources:\n-" in summary_text:
+            return summary_text
+        return summary_text + block
 
     def summarize_story_openai(self, representatives: List[Dict]) -> Dict:
         # if LLM disabled, fall back
@@ -482,6 +499,8 @@ class NewsAggregator:
         story_key = self._story_key_from_reps(representatives)
         cached = self.get_cached_summary(story_key, self.config.model_name)
         if cached:
+            logger.info("Using cached LLM summary for story_key=%s model=%s", story_key[:12], self.config.model_name)
+            cached = self._with_sources_block(cached, representatives)
             return {
                 "title": representatives[0]["title"],
                 "summary": cached,
@@ -506,7 +525,7 @@ OUTPUT:
 1) Headline (should convey the main thrust of the story)
 2) Five bullets (Who/What/Where/When/Why)
 3) 3–5 key facts with numbers/dates
-4) Where sources agree/disagree (bullets); cite outlets and lean when noting disagreement. Example: "- **Disagree**: Extent of willingness to negotiate; left/center (Guardian, BBC) say ready to engage, right (Daily Wire) highlights reluctance due to sovereignty concerns."
+4) Where sources agree/disagree (bullets). Only include if >2 distinct sources; cite outlets and lean when noting disagreement. Example: "- **Disagree**: Extent of willingness to negotiate; left/center (Guardian, BBC) say ready to engage, right (Daily Wire) highlights reluctance due to sovereignty concerns."
 5) One-paragraph context (most relevant current, historical, economic, political, and/or social)
 6) Why this story matters (engaging, concise, factual explanation of how this impacts people in daily life)
 Be concise, factual, neutral."""
@@ -526,6 +545,7 @@ Be concise, factual, neutral."""
                     temperature=0.2,
                 )
                 txt = resp.choices[0].message.content.strip()
+                txt = self._with_sources_block(txt, representatives)
                 # save in cache
                 story_id = f"llm_{hashlib.sha256((story_key + self.config.model_name).encode()).hexdigest()[:16]}"
                 self.put_cached_summary(story_id, story_key, self.config.model_name, txt)
@@ -793,7 +813,7 @@ Be concise, factual, neutral."""
         kept = 0
         skipped = 0
 
-        for i, cluster in enumerate(clusters[:15]):
+        for i, cluster in enumerate(clusters[:25]):
             reps = self.select_representatives(cluster)
             if not reps:
                 continue
@@ -801,8 +821,11 @@ Be concise, factual, neutral."""
             # importance: try LLM for top-N (if enabled), else heuristics
             scores = None
             if self.config.use_llm_importance and i < self.config.llm_importance_top_n:
+                logger.info("LLM importance scoring for cluster %d", i + 1)
                 scores = self._llm_importance(cluster)
             if not scores:
+                if self.config.use_llm_importance and i < self.config.llm_importance_top_n:
+                    logger.info("Falling back to heuristic importance for cluster %d", i + 1)
                 scores = self._heuristic_importance(cluster)
 
             avg_score = self._weighted_average(scores)
@@ -815,6 +838,7 @@ Be concise, factual, neutral."""
                 continue
 
             use_llm_now = (not getattr(self, "llm_disabled_for_run", False)) and self.config.use_openai and (i < self.config.llm_top_n)
+            logger.info("Summarizing cluster %d with %s (size=%d)", i + 1, "LLM" if use_llm_now else "local", len(cluster))
             story = self.summarize_story_openai(reps) if use_llm_now else self.summarize_story_local(reps)
             story["cluster_size"] = len(cluster)
             story["story_id"] = f"story_{i}_{datetime.now().strftime('%Y%m%d')}"
